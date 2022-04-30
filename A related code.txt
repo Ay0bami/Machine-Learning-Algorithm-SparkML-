@@ -1,0 +1,223 @@
+/*
+
+--We do not own the copyright to this code
+
+--This the random forest machine learning algorithm for predicting the fatality of covid-19
+--cases in toronto.
+
+*/
+
+
+
+-- Run spark-shell
+
+spark-shell --master yarn
+
+/*
+-- Bunch of import statements
+*/
+
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.ml.feature.{VectorAssembler, StringIndexer}
+import org.apache.spark.ml.Pipeline
+import org.apache.spark.ml.classification.{RandomForestClassificationModel, RandomForestClassifier}
+import org.apache.spark.ml.tuning.{CrossValidator, CrossValidatorModel, ParamGridBuilder}
+import org.apache.spark.ml.evaluation.{MulticlassClassificationEvaluator}
+import org.apache.spark.ml.param.ParamMap
+import org.apache.spark.sql.types.{IntegerType}
+import org.apache.spark.sql.SQLContext
+import org.apache.spark.sql.DataFrame
+import org.apache.spark.SparkContext
+
+
+/*
+
+--Load dataset from HDFS and clean from Null values
+
+*/
+
+
+val df=spark.read
+.format("csv")
+.option("header", "true")
+.load("hdfs://10.128.0.3:8020/BigData/covid/COVID.csv")
+val cleanDF df.na.drop()
+
+cleanDF.show(10)
+cleanDF.schema(10)
+
+
+/*
+
+--Load the new dataset filtering only column considered for calculation
+
+*/
+
+val dataset=cleanDF.select(col("outcome")),
+col("Age Group"),
+col("Ever Hospitalized"),
+col("Ever in ICU"),
+col("Client Gender"))
+.filter(cleanDF("Classification")==="CONFIRMED")
+
+dataset.show(10)
+
+
+/*
+
+--balanced dataset with Random Undersampling by removing examples from training dataset that 
+--belong to the majority class in order to better balance the class distribution.
+
+*/
+
+val fatalityDF = dataset.filter(dataset("Outcome") === "FATAL")
+val nonfatalityDF = dataset.filter(dataset("Outcome") === "RESOLVED")
+
+val sampleRatio = fatilityDF.count().toDouble / dataset.count().toDouble
+val nonfatalitySampleDF = nonfatalityDF.sample(false, sampleRation)
+
+val dfBalanced = fatalityDF.unionAll(nonfatalitySampleDF)
+dfBalanced.show(10)
+
+/*
+
+--Indexing - Multiple Column feature transformation Indexing. Create the index for other
+--variables and after the indexer for the prediction column.
+
+*/
+
+val inputColumns = Array("Age Group", "Ever Hospitalized", "Ever in ICU", "Client Gender")
+val outputColumns = Array("Age_index", "Hopitalized_index", "ICU_index", "Gender_index")
+
+
+val indexer = new StringIndexer()
+indexer.setInputCols(inputColumns)
+indexer.setOutputCols(outputColumns)
+
+val stringIndexer = new StringIndexer()
+.setInputCol("Outcome")
+.setOutputCol("Outcome_index")
+
+val DF_indexed = indexer.fit(dfBalanced).transform(dfBalanced)
+val DF_indexed2 = stringIndexer.fit(DF_indexed).transform(DF_indexed)
+
+val rankDF = DF_indexed2.select(col("Outcome_index").cast(IntegerType),
+col("Age_index").cast(IntegerType),
+col("Hospitalized_index").cast(IntegerType),
+col("ICU_index").cast(IntegerType),
+col("Gender_index").cast(IntegerType))
+rankDF.show(12)
+
+
+/*
+
+--OneHotEncoder after Indexing
+
+--The input to this transformer should be a matrix of integers, denoting the values taken
+--on by categorical features and the output will be a sparse matrix where each column corresponds
+--to one possible values of one feature.
+
+*/
+
+val encoder = new OneHotEncoder()
+.setInputCols(Array("Age_index","Hospitalized_index","ICU_index","Gender_index"))
+.setOutputCols(Array("Age_vector","Hospitalized_vector","ICU_vector","Gender_vector"))
+
+val DF_Encoder = encoder.fit(rankDF).transform(rankDF)
+
+DF_Encoder.show(12)
+
+/*
+
+--Random Forest Machine Learning Algorithm 
+--Dataset divided into training and test (80, 20)
+
+*/
+
+val assembler = new VectorAssembler()
+.setInputCols(Array("Age_vector","Hospitalized_vector","ICU_vector","Gender_vector",
+"Age_index","Hospitalized_vector","ICU_vector","Gender_index"))
+.setOutputCol("assembled-features")
+
+/*
+
+--Random forest object given features as vector and index columns
+
+*/
+
+val rf = new RandomForestClassifier()
+.setFeaturesCol("assembled-features")
+.setLabelCol("Outcome_index")
+.setSeed(1234)
+
+val pipeline = new Pipeline()
+.setStages(Array(assembler,rf))
+
+/*
+
+--Evaluator provided and compared Outcome indexed value with prediction calculating the
+--successful model with accuracy of results
+
+*/
+
+val evaluator = new MulticlassClassificationEvaluator()
+.setLabelCol("Outcome_index")
+.setPredictionCol("prediction")
+.setMetricName("accuracy")
+
+val paramGrid = new ParamGridBuilder()
+.addGrid(rf.maxDepth, Array(3,4))
+.addGrid(rf.impurity, Array("entropy", "gini")).build()
+
+val cross_validator = new CrossValidator()
+.setEstimator(pipeline)
+.setEvaluator(evaluator)
+.setEstimatorParamMaps(paramGrid)
+.setNumfolds(3)
+
+/*
+
+--Train the model on training data and predict with test dataset
+--Also Evaluate the model
+
+*/
+
+
+val cvModel = cross_validator.fit(trainingData)
+
+val predictions = cvModel.transform(testData)
+
+val accuracy = evaluator.evaluate(predictions)
+println("accuracy on the test data" + accuracy)
+
+
+/*
+
+--Save your output to a csv  file   with the header
+
+*/
+
+
+predictions
+.select(col("Outcome_Index"),
+col("Age_index"),
+col("Gender_index"),
+col("Hospitalized_index"),
+col("ICU_index"),
+col("prediction"))
+.write
+.format("csv")
+.option("header", "true")
+.save("hdfs://10.128.0.3:8020/BigData/prediction.csv")
+
+
+
+
+
+
+
+
+
+
+
