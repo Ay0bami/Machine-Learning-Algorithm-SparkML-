@@ -1,0 +1,217 @@
+/*
+
+We do not own the copyright to this codes
+
+*/
+
+
+*********************************************************
+*********************************************************
+	US Election Prediction - Random Forest
+*********************************************************
+*********************************************************
+
+-- Download datasets
+
+wget https://www.dropbox.com/s/us4gq9zurx4vla1/county_facts.csv
+wget https://www.dropbox.com/s/ni0iavp58dlx5vf/primary_results.csv
+
+
+-- County facts is used for analysis by you (county_facts columns are codes)
+
+wget https://www.dropbox.com/s/wimp3r3e00q8b2x/county_facts_dictionary.csv
+
+
+-- Run spark-shell
+
+spark-shell --master yarn
+
+/*
+-- Bunch of import statements
+*/
+
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.expressions.Window
+import org.apache.spark.ml.feature.{VectorAssembler, StringIndexer}
+import org.apache.spark.ml.Pipeline
+import org.apache.spark.ml.classification.{RandomForestClassificationModel, RandomForestClassifier}
+import org.apache.spark.ml.tuning.{CrossValidator, CrossValidatorModel, ParamGridBuilder}
+import org.apache.spark.ml.evaluation.{MulticlassClassificationEvaluator}
+import org.apache.spark.ml.param.ParamMap
+import org.apache.spark.sql.types.{IntegerType, DoubleType}
+
+
+val results = spark.read
+ .format("csv")
+ .option("header", "true")
+ .load("hdfs://10.128.0.55:8020/BigData/primary_results.csv")
+
+val county = spark.read
+ .format("csv")
+ .option("header", "true")
+  .load("hdfs://10.128.0.55:8020/BigData/county_facts.csv")
+
+
+val results_rep = results.filter(col("party") === "Republican")
+
+//Join results with county
+val join_expr = results_rep.col("fips") === county.col("fips").cast(IntegerType)
+
+/*
+-- To load the information, we need to make sense of the file, we use the description in county_facts_dictionry.csv
+-- White, hispanic, college are all represented by percentages
+-- Income represented the medium household income of the county
+-- pop_density = population per square mile
+-- Here we are joining the results files with the county file based on the county id
+-- we'll cast to the respective types, all numberical columns will be doubles
+*/
+
+val raw_dataset = results_rep.join(county, join_expr).drop(county.col("fips")).select(
+ col("fips").alias("county_id"), 
+ col("area_name").alias("county"), 
+ col("RHI125214").cast(DoubleType).alias("white"), 
+ col("RHI725214").cast(DoubleType).alias("hispanic"), 
+ col("INC110213").cast(DoubleType).alias("income"), 
+ col("EDU685213").cast(DoubleType).alias("college"),
+ col("POP060210").cast(DoubleType).alias("pop_density"),
+ col("candidate"), 
+ col("fraction_votes").cast(DoubleType))
+
+/*
+//Group by county & Rank by votes  
+-- We don't have a winner column but we can derive it (recall feature engineering)
+-- We can group the records by county, and within each county we rank the records by fraction_votes
+-- Next we filter the records with rank 1
+-- We are using a window function to group the records by county
+*/
+
+val windowSpec = Window.partitionBy(col("county_id")).orderBy(col("fraction_votes").desc)
+val ranking = rank().over(windowSpec)
+/*
+-- Next we select the columns that we need
+-- And we fetch just the records with rank 1
+-- We are also filtering out a candidate called Ben Carson
+-- Ben Carson dropped out and it causes issues here
+*/
+
+val dataset = raw_dataset.select(col("county_id"), col("county"), col("white"), col("hispanic"), 
+ col("income"), col("college"), col("pop_density"), col("candidate"), col("fraction_votes"), ranking.alias("rank"))
+ .filter(col("rank") === lit(1) and !(col("candidate") === lit("Ben Carson")))
+
+/*
+-- Split our dataset into training and test data typical 80 20
+-- we give a seed so we have the same random data in each set
+*/
+
+val Array(trainingData, testData) = dataset.randomSplit(Array(0.8, 0.2), 754) 
+
+/*Index the candidate (String) column
+-- Our candidate column is of type string --> not very good for ML algorithms
+-- We use the StringIndexer to index the column values to number 
+-- Ex Donald Trump = 1, Ted Cruz = 2, etc...
+-- We call this new column "candidate_index"
+*/
+
+
+val indexer = new StringIndexer()
+  .setInputCol("candidate")
+  .setOutputCol("candidate_indexed")    
+
+/*
+-- note this is the reason we get rid of Ben Carson --> he only has two values, can end up in test set 
+-- model will train it based on the training set and will give error (what is ben carson)
+//Assemble all features
+-- Next we assemble our features using vector assembler, this time we have more than one feature
+*/
+
+val assembler = new VectorAssembler()
+ .setInputCols(Array("white", "hispanic", "income", "college", "pop_density"))
+ .setOutputCol("assembled-features")
+
+/*Random Forest  
+-- We now create a new random forest object 
+-- give features (as a vector)
+-- give the label as candiate_indexed (can't use the string column)
+*/
+
+val rf = new RandomForestClassifier()
+ .setFeaturesCol("assembled-features")
+ .setLabelCol("candidate_indexed")
+ .setSeed(1234)
+  
+/*Set up pipeline
+-- Use pipepline to set our stages
+-- So our stages are the string indexer, the vector assembler and the random forest classifier object
+*/
+
+
+val pipeline = new Pipeline()
+  .setStages(Array(indexer, assembler, rf))
+
+/*To evaluate the model
+-- Next we provide the evaluator
+-- For regressoin we used RegressionEvaluator
+-- the metric accuracy was simply a percentage
+-- Here we are using MulticlassClassificationEvaluator
+-- we compared candidate_indexed ot the prediction column
+-- IF the match, prediction is good else it is unsuccession
+-- metric "accuracy" is basically percentage of accurate results
+*/
+
+val evaluator = new MulticlassClassificationEvaluator()
+  .setLabelCol("candidate_indexed")
+  .setPredictionCol("prediction")
+  .setMetricName("accuracy")
+/*
+-- Here we are trying hyper parameters
+-- First is maxDepth, it's an array with two values, 5, 10 
+-- maxDepth puts a limit on how deep we can construct the tree
+-- Remember, we said that with decision trees main problem was overfitting the data
+-- random forest does a better job but still, there is an issue if we allow the tree to be too deep
+-- so good idea to set the max depth
+-- Second is impurity which we give as entropy (there are other statistical methods to select features).
+*/
+
+val paramGrid = new ParamGridBuilder()  
+  .addGrid(rf.maxDepth, Array(3, 5))
+  .addGrid(rf.impurity, Array("entropy","gini")).build()
+
+/*Cross validate model
+-- Next we tie everything together with cross-validator
+-- We set the pipeline for estimator
+-- Multiclassevaluator for evaluator
+-- Set the hyper parameters and the number of folds
+-- Cross validator will divide the training data set into 3
+-- Next each fold is coupled with the paramters for each type
+-- Fold 1 is tried with max depth 3 and entropy and then fold 1 is again tried but this time with max depth 5 and entrop
+-- Next fold 2 is tried with max depth 3 and entropy, and again with max depth 5 and entropy
+-- And so on ...
+-- In total, we will have 3 (folds) x 2 (depth) x 2 (algorithms) = 12 models
+-- the best model is picked
+*/
+val cross_validator = new CrossValidator()
+  .setEstimator(pipeline)
+  .setEvaluator(evaluator)
+  .setEstimatorParamMaps(paramGrid)
+  .setNumFolds(3)
+
+/*
+-- Train the model on training data
+-- Gives us the best model from the 6 variations
+*/
+
+val cvModel = cross_validator.fit(trainingData)
+
+/*Predict with test data
+-- Transform testData with predictions
+*/
+
+val predictions = cvModel.transform(testData)
+
+/*Evaluate the model
+-- check with actual values and print accuracy
+*/
+
+val accuracy = evaluator.evaluate(predictions)
+
+println("accuracy on test data = " + accuracy)
